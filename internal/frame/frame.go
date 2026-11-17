@@ -111,6 +111,11 @@ func Read(source FullReader, position int64, prev *Frame) (frame *Frame, startPo
 	return nf, pos, nil
 }
 
+// Header returns the frame's header.
+func (f *Frame) Header() frameheader.FrameHeader {
+	return f.header
+}
+
 func (f *Frame) SamplingFrequency() (int, error) {
 	return f.header.SamplingFrequencyValue()
 }

@@ -16,6 +16,7 @@ package mp3
 
 import (
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/hajimehoshi/go-mp3/internal/consts"
@@ -27,19 +28,23 @@ import (
 //
 // Decoder decodes its underlying source on the fly.
 type Decoder struct {
-	source        *source
-	sampleRate    int
-	length        int64
-	frameStarts   []int64
-	buf           []byte
-	frame         *frame.Frame
-	pos           int64
-	bytesPerFrame int64
+	source          *source
+	sampleRate      int
+	length          int64
+	frameStarts     []int64
+	buf             []byte
+	frame           *frame.Frame
+	frameStart      int64
+	pos             int64
+	bytesPerFrame   int64
+	firstFrameStart int64
+	firstHeader     frameheader.FrameHeader
+	xing            *xingHeader
 }
 
 func (d *Decoder) readFrame() error {
 	var err error
-	d.frame, _, err = frame.Read(d.source, d.source.pos, d.frame)
+	d.frame, d.frameStart, err = frame.Read(d.source, d.source.pos, d.frame)
 	if err != nil {
 		if err == io.EOF {
 			return io.EOF
@@ -71,6 +76,14 @@ func (d *Decoder) Read(buf []byte) (int, error) {
 //
 // Seek returns an error when the underlying source is not io.Seeker.
 //
+// Seek returns an error when the resulting position is negative or, when the
+// total length is known, beyond the end of the stream.
+//
+// When the decoder was created with NewFastSeekDecoder and the stream has a
+// usable Xing/Info TOC, Seek approximates the target frame with the TOC and
+// decodes forward from there instead of scanning the whole file. If the TOC
+// turns out to be unusable, Seek falls back to the exact (scanning) behavior.
+//
 // Note that seek uses a byte offset but samples are aligned to 4 bytes (2
 // channels, 2 bytes each). Be careful to seek to an offset that is divisible by
 // 4 if you want to read at full sample boundaries.
@@ -91,10 +104,59 @@ func (d *Decoder) Seek(offset int64, whence int) (int64, error) {
 	default:
 		return 0, errors.New("mp3: invalid whence")
 	}
+	if npos < 0 {
+		return 0, fmt.Errorf("mp3: negative position: %d", npos)
+	}
+
+	if d.xing != nil {
+		if npos > d.length {
+			return 0, fmt.Errorf("mp3: position %d exceeds the stream length %d", npos, d.length)
+		}
+		if err := d.seekWithXing(npos); err == nil {
+			return npos, nil
+		}
+		// The Xing/Info TOC was not usable. Disable the fast path and fall
+		// back to the exact seek by scanning the whole stream once.
+		d.xing = nil
+		d.length = invalidLength
+		d.frameStarts = nil
+		if err := d.ensureFrameStartsAndLength(); err != nil {
+			return 0, err
+		}
+	}
+	if d.length != invalidLength && npos > d.length {
+		return 0, fmt.Errorf("mp3: position %d exceeds the stream length %d", npos, d.length)
+	}
+	return d.seekExact(npos)
+}
+
+// seekExact positions the decoder at the given PCM byte position by using the
+// frame positions found by scanning the whole stream.
+func (d *Decoder) seekExact(npos int64) (int64, error) {
 	d.pos = npos
 	d.buf = nil
 	d.frame = nil
+	if len(d.frameStarts) == 0 {
+		// The frame positions are unknown e.g. because the source is
+		// not an io.Seeker.
+		if _, err := d.source.Seek(0, io.SeekStart); err != nil {
+			return 0, err
+		}
+		return 0, errors.New("mp3: cannot seek without frame positions")
+	}
 	f := d.pos / d.bytesPerFrame
+	if f >= int64(len(d.frameStarts)) {
+		// The position is at the end of the stream. Position the source so
+		// that the next Read reports io.EOF.
+		if _, err := d.source.Seek(d.frameStarts[len(d.frameStarts)-1], 0); err != nil {
+			return 0, err
+		}
+		if err := d.readFrame(); err != nil {
+			return 0, err
+		}
+		d.buf = nil
+		return npos, nil
+	}
 	// If the frame is not first, read the previous ahead of reading that
 	// because the previous frame can affect the targeted frame.
 	if f > 0 {
@@ -192,6 +254,10 @@ const invalidLength = -1
 //
 // Length returns -1 when the total size is not available
 // e.g. when the given source is not io.Seeker.
+//
+// When the decoder was created with NewFastSeekDecoder and the stream has a
+// Xing/Info header, the length is derived from the header's frame count
+// without scanning the whole source.
 func (d *Decoder) Length() int64 {
 	return d.length
 }
@@ -201,7 +267,25 @@ func (d *Decoder) Length() int64 {
 // The stream is always formatted as 16bit (little endian) 2 channels
 // even if the source is single channel MP3.
 // Thus, a sample always consists of 4 bytes.
+//
+// When the source is an io.Seeker, NewDecoder scans the whole source once to
+// determine the frame positions for Seek and Length. Use NewFastSeekDecoder
+// to avoid this scan for streams with a Xing/Info header.
 func NewDecoder(r io.Reader) (*Decoder, error) {
+	return newDecoder(r, false)
+}
+
+// NewFastSeekDecoder is like NewDecoder, but when the source is an io.Seeker
+// and the stream's first frame carries a Xing/Info header with a valid TOC,
+// it does not scan the whole source: Length is derived from the header and
+// Seek approximates the target frame via the TOC and then decodes forward to
+// the exact requested position. If the header is missing or unusable, the
+// decoder deterministically falls back to NewDecoder's behavior.
+func NewFastSeekDecoder(r io.Reader) (*Decoder, error) {
+	return newDecoder(r, true)
+}
+
+func newDecoder(r io.Reader, fastSeek bool) (*Decoder, error) {
 	s := &source{
 		reader: r,
 	}
@@ -222,6 +306,19 @@ func NewDecoder(r io.Reader) (*Decoder, error) {
 		return nil, err
 	}
 	d.sampleRate = freq
+
+	if fastSeek {
+		d.firstFrameStart = d.frameStart
+		d.firstHeader = d.frame.Header()
+		if _, ok := r.(io.Seeker); ok {
+			if x := d.readXingHeader(); x != nil {
+				d.xing = x
+				d.bytesPerFrame = int64(d.firstHeader.BytesPerFrame())
+				d.length = x.frames * d.bytesPerFrame
+				return d, nil
+			}
+		}
+	}
 
 	if err := d.ensureFrameStartsAndLength(); err != nil {
 		return nil, err
