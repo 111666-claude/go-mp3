@@ -16,8 +16,16 @@ package mp3
 
 import (
 	"errors"
+	"fmt"
 	"io"
 )
+
+// maxID3v2TagSize is the maximum size in bytes of an ID3v2 tag that
+// skipTags is willing to skip. A larger declared size is reported as an
+// error instead of being read, so that a corrupt or malicious size field
+// can neither trigger a huge allocation nor make a non-seekable stream
+// wait for data that never arrives.
+const maxID3v2TagSize = 64 << 20 // 64 MiB
 
 type source struct {
 	reader io.Reader
@@ -68,8 +76,12 @@ func (s *source) skipTags() error {
 		}
 		size := (uint32(buf[0]) << 21) | (uint32(buf[1]) << 14) |
 			(uint32(buf[2]) << 7) | uint32(buf[3])
-		buf = make([]byte, size)
-		if _, err := s.ReadFull(buf); err != nil {
+		if size > maxID3v2TagSize {
+			return fmt.Errorf("mp3: ID3v2 tag at position %d declares %d bytes, which exceeds the limit of %d bytes", s.pos-10, size, maxID3v2TagSize)
+		}
+		// Skip the tag body in chunks rather than allocating it at once,
+		// so that large tags work on non-seekable streams too.
+		if err := s.discard(int64(size)); err != nil {
 			return err
 		}
 
@@ -77,6 +89,22 @@ func (s *source) skipTags() error {
 		s.Unread(buf)
 	}
 
+	return nil
+}
+
+// discard reads and throws away exactly n bytes from the source.
+func (s *source) discard(n int64) error {
+	buf := make([]byte, 32*1024)
+	for n > 0 {
+		m := int64(len(buf))
+		if m > n {
+			m = n
+		}
+		if _, err := s.ReadFull(buf[:m]); err != nil {
+			return err
+		}
+		n -= m
+	}
 	return nil
 }
 
@@ -103,6 +131,10 @@ func (s *source) ReadFull(buf []byte) (int, error) {
 		} else {
 			s.buf = nil
 		}
+		// Bytes served from the unread buffer also advance the position:
+		// Unread moved the position back, so consuming them moves it
+		// forward again.
+		s.pos += int64(read)
 		if len(buf) == read {
 			return read, nil
 		}
