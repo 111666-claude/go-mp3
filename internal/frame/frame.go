@@ -21,6 +21,7 @@ import (
 
 	"github.com/hajimehoshi/go-mp3/internal/bits"
 	"github.com/hajimehoshi/go-mp3/internal/consts"
+	"github.com/hajimehoshi/go-mp3/internal/crc16"
 	"github.com/hajimehoshi/go-mp3/internal/frameheader"
 	"github.com/hajimehoshi/go-mp3/internal/imdct"
 	"github.com/hajimehoshi/go-mp3/internal/maindata"
@@ -52,26 +53,75 @@ type FullReader interface {
 	ReadFull([]byte) (int, error)
 }
 
-func readCRC(source FullReader) error {
+func readCRC(source FullReader) (uint16, error) {
 	buf := make([]byte, 2)
 	if n, err := source.ReadFull(buf); n < 2 {
 		if err == io.EOF {
-			return &consts.UnexpectedEOF{"readCRC"}
+			return 0, &consts.UnexpectedEOF{At: "readCRC"}
 		}
-		return fmt.Errorf("mp3: error at readCRC: %v", err)
+		return 0, fmt.Errorf("mp3: error at readCRC: %v", err)
+	}
+	return uint16(buf[0])<<8 | uint16(buf[1]), nil
+}
+
+// crcReader feeds every byte read from the underlying reader into a CRC-16
+// checksum. It is used to cover the side information of a protected frame.
+type crcReader struct {
+	source FullReader
+	crc    *crc16.CRC16
+}
+
+func (c *crcReader) ReadFull(buf []byte) (int, error) {
+	n, err := c.source.ReadFull(buf)
+	c.crc.Write(buf[:n])
+	return n, err
+}
+
+// discardMainData reads and discards the main data of a frame whose header
+// and side information were already consumed, so that the stream is left at
+// the next frame boundary.
+func discardMainData(source FullReader, h frameheader.FrameHeader) error {
+	framesize, err := h.FrameSize()
+	if err != nil {
+		return err
+	}
+	size := framesize - h.SideInfoSize() - 4 // sync+header
+	if h.ProtectionBit() == 0 {
+		size -= 2 // CRC
+	}
+	if size < 0 {
+		return fmt.Errorf("mp3: invalid frame size %d", framesize)
+	}
+	buf := make([]byte, size)
+	if n, err := source.ReadFull(buf); n < size {
+		if err == io.EOF {
+			return &consts.UnexpectedEOF{At: "discardMainData"}
+		}
+		return err
 	}
 	return nil
 }
 
-func Read(source FullReader, position int64, prev *Frame) (frame *Frame, startPosition int64, err error) {
+func Read(source FullReader, position int64, prev *Frame, verifyCRC bool) (frame *Frame, startPosition int64, err error) {
 	h, pos, err := frameheader.Read(source, position)
 	if err != nil {
 		return nil, 0, err
 	}
 
+	var expectedCRC uint16
+	var crc *crc16.CRC16
 	if h.ProtectionBit() == 0 {
-		if err := readCRC(source); err != nil {
+		var err error
+		expectedCRC, err = readCRC(source)
+		if err != nil {
 			return nil, 0, err
+		}
+		if verifyCRC {
+			crc = crc16.New()
+			// The CRC-16 covers the 3rd and 4th bytes of the frame header
+			// followed by the side information.
+			crc.Write([]byte{byte(h >> 8), byte(h)})
+			source = &crcReader{source: source, crc: crc}
 		}
 	}
 
@@ -85,6 +135,23 @@ func Read(source FullReader, position int64, prev *Frame) (frame *Frame, startPo
 	si, err := sideinfo.Read(source, h)
 	if err != nil {
 		return nil, 0, err
+	}
+
+	if crc != nil {
+		if actual := crc.Sum(); actual != expectedCRC {
+			// The frame is corrupt. Consume its main data so that the
+			// stream is positioned at the next frame boundary and the
+			// caller can decide to skip this frame and continue.
+			if err := discardMainData(source, h); err != nil {
+				return nil, 0, err
+			}
+			return nil, 0, &consts.CRCError{
+				Position:      pos,
+				Expected:      expectedCRC,
+				Actual:        actual,
+				BytesPerFrame: h.BytesPerFrame(),
+			}
+		}
 	}
 
 	// If there's not enough main data in the bit reservoir,

@@ -26,6 +26,27 @@ func (u *UnexpectedEOF) Error() string {
 	return fmt.Sprintf("mp3: unexpected EOF at %s", u.At)
 }
 
+// A CRCError is reported when a CRC-protected MPEG Layer III frame fails
+// its CRC-16 verification.
+type CRCError struct {
+	// Position is the byte offset of the frame in the stream.
+	Position int64
+	// Expected is the CRC-16 value stored in the frame.
+	Expected uint16
+	// Actual is the CRC-16 value computed over the received header and
+	// side information.
+	Actual uint16
+	// BytesPerFrame is the number of PCM bytes the frame would have
+	// produced. A decoder that skips the corrupt frame can use this to
+	// keep the PCM time position of the following frames.
+	BytesPerFrame int
+}
+
+func (c *CRCError) Error() string {
+	return fmt.Sprintf("mp3: CRC mismatch at frame offset %d: expected 0x%04x, got 0x%04x",
+		c.Position, c.Expected, c.Actual)
+}
+
 type Version int
 
 const (
